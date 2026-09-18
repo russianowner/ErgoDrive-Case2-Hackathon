@@ -1,0 +1,218 @@
+@page "/"
+@rendermode InteractiveServer
+@using AutoFleet_Vision.Components.Services
+@inject GroqVisionService VisionService
+@inject IJSRuntime JS
+
+<div class="vision-page">
+    <header class="hero-panel">
+        <div class="brand-lockup">
+            <div class="brand-logo-card">
+                <img src="/images/logo.png" alt="ErgoDrive"/>
+            </div>
+            <div>
+                <p class="eyebrow">АГРОТЕХ · CHECKPOINT INTELLIGENCE</p>
+                <h1>ErgoDrive</h1>
+                <p class="hero-copy">Контроль въезда, весовой и визуальной загрузки транспорта</p>
+            </div>
+        </div>
+
+        <div class="hero-actions">
+            <button class="action-button danger" @onclick="ClearDatabase" disabled="@(!results.Any())">Очистить</button>
+            <button class="action-button" @onclick="ExportJson" disabled="@(!results.Any())">JSON</button>
+            <button class="action-button" @onclick="ExportCsv" disabled="@(!results.Any())">CSV</button>
+        </div>
+    </header>
+
+    <div class="field tg-field">
+            <label for="tgChat">Уведомления (Telegram)</label>
+            <input id="tgChat" @bind="telegramChat" placeholder="ID чата или канал" />
+        </div>
+
+    <section class="control-panel">
+        <div class="field path-field">
+            <label for="folderPath">Папка с кадрами камеры</label>
+            <input id="folderPath" @bind="folderPath" placeholder="C:\\Cameras\\Checkpoint" />
+        </div>
+
+        <div class="field">
+            <label for="model">Модель</label>
+            <select id="model" @bind="selectedModel">
+                <option value="qwen/qwen3.8-27b">Qwen 3.8 Vision</option>
+            </select>
+            <label class="reprocess-toggle" title="Перезапишет сохранённые результаты для выбранных кадров новым, более строгим анализом.">
+                <input type="checkbox" @bind="forceReprocess" />
+                <span>Переанализировать кадры</span>
+            </label>
+            <label class="reprocess-toggle" title="Отправляет полный кадр и увеличенные фрагменты. Для нечётких или слишком маленьких номеров результат всё равно останется «Не читается».">
+                <input type="checkbox" @bind="enhancedPlateOcr" />
+                <span>Увеличивать фрагменты для номера</span>
+            </label>
+        </div>
+
+        <button class="run-button" @onclick="ProcessDirectory" disabled="@isProcessing">
+            @(isProcessing ? $"Обработка: {processedCount} / {totalCount}" : "Обработать кадры")
+        </button>
+
+        @if (isProcessing)
+        {
+            <div class="processing-info">
+                <div class="processing-label">
+                    <span>@processingMessage</span>
+                    <span>@processedCount / @totalCount</span>
+                </div>
+                <div class="processing-track">
+                    <div class="processing-value" style="width: @(totalCount > 0 ? processedCount * 100 / totalCount : 0)%"></div>
+                </div>
+            </div>
+        }
+
+        @if (!string.IsNullOrWhiteSpace(lastRunMessage))
+        {
+            <p class="run-message" role="status">@lastRunMessage</p>
+        }
+    </section>
+
+    <section class="metric-grid" aria-label="Сводка контроля">
+        <article class="metric-card">
+            <span>Кадров обработано</span>
+            <strong>@results.Count</strong>
+        </article>
+        <article class="metric-card">
+            <span>Связанных рейсов</span>
+            <strong>@visits.Count</strong>
+        </article>
+        <article class="metric-card">
+            <span>Завершённые рейсы</span>
+            <strong>@visits.Count(visit => visit.State == "Завершён")</strong>
+        </article>
+        <article class="metric-card">
+            <span>Кадров на весах</span>
+            <strong>@results.Count(result => result.CheckpointStatus == "На весах")</strong>
+        </article>
+    </section>
+
+    <section class="results-panel visit-panel">
+        <div class="results-header">
+            <div>
+                <p class="eyebrow">РЕЙСЫ</p>
+                <h2>Время на территории</h2>
+                <p class="results-copy">Кадры объединяются только при номере с надёжностью ≥ 90%, совпадающем профиле и интервале не больше 90 минут.</p>
+            </div>
+            <span class="result-count">@visits.Count</span>
+        </div>
+
+        <div class="table-scroll">
+            <table class="vision-table visit-table">
+                <thead>
+                    <tr>
+                        <th>Гос. номер</th>
+                        <th>Транспорт</th>
+                        <th>Начало</th>
+                        <th>Конец</th>
+                        <th>Длительность</th>
+                        <th>Загрузка</th>
+                        <th>Кадров</th>
+                        <th>Основание связки</th>
+                        <th>Контроль</th>
+                        <th>Статус рейса</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @if (!visits.Any())
+                    {
+                        <tr>
+                            <td colspan="10" class="empty-state">Нужны дата/время и надёжно читаемый номер. Сомнительные номера намеренно не объединяются в рейс.</td>
+                        </tr>
+                    }
+                    @foreach (var visit in visits)
+                    {
+                        <tr>
+                            <td><span class="plate-badge">@visit.PlateNumber</span></td>
+                            <td>@visit.VehicleName</td>
+                            <td class="time-cell">@FormatCapturedAt(visit.StartedAt)</td>
+                            <td class="time-cell">@FormatCapturedAt(visit.EndedAt)</td>
+                            <td class="duration-cell">@FormatDuration(visit.Duration)</td>
+                            <td>@visit.LoadChange</td>
+                            <td>@visit.EventCount</td>
+                            <td class="match-basis">@visit.MatchBasis</td>
+                            <td><span class="risk-pill @RiskClass(visit.RiskStatus)">@visit.RiskStatus</span></td>
+                            <td>
+                                <span class="visit-state @(visit.State == "Завершён" ? "done" : "waiting")">@visit.State</span>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="results-panel">
+        <div class="results-header">
+            <div>
+                <p class="eyebrow">КАДРЫ КПП</p>
+                <h2>Распознанные события</h2>
+                <p class="results-copy">Одна строка — один основной транспорт на весах. Загрузка выводится только когда камера видит содержимое кузова; это не показание весов.</p>
+            </div>
+            <span class="result-count">@results.Count</span>
+        </div>
+
+        <div class="table-scroll">
+            <table class="vision-table checkpoint-table">
+                <thead>
+                    <tr>
+                        <th>Кадр</th>
+                        <th>Дата и время</th>
+                        <th>Камера</th>
+                        <th>Транспорт</th>
+                        <th>Марка / модель</th>
+                        <th>Профиль единицы</th>
+                        <th>Гос. номер</th>
+                        <th>Позиция</th>
+                        <th>Визуальная загрузка</th>
+                        <th>Анализ</th>
+                        <th>Статус</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @if (!results.Any())
+                    {
+                        <tr>
+                            <td colspan="11" class="empty-state">Укажите папку с кадрами камеры и запустите обработку.</td>
+                        </tr>
+                    }
+                    @foreach (var item in results)
+                    {
+                        <tr>
+                            <td class="file-name" title="@item.FileName">@item.FileName</td>
+                            <td class="time-cell">@FormatCapturedAt(item.CapturedAt)</td>
+                            <td>@item.CameraId</td>
+                            <td>@(string.IsNullOrWhiteSpace(item.TransportUnit) || item.TransportUnit == "Не определено" ? item.VehicleType : item.TransportUnit)</td>
+                            <td>@FormatVehicleName(item)</td>
+                            <td class="profile-cell">@FormatProfile(item)</td>
+                            <td>
+                                <span class="plate-badge">@FormatPlate(item)</span>
+                                <span class="identity-pill @PlateClass(item)">@FormatPlateStatus(item)</span>
+                            </td>
+                            <td>@item.CheckpointStatus</td>
+                            <td>
+                                <span class="load-pill @LoadClass(item.LoadStatus)">@FormatLoad(item)</span>
+                            </td>
+                            <td class="time-cell">@item.ProcessingTimeMs мс</td>
+                            <td>
+                                @if (item.Status == "Успешно")
+                                {
+                                    <span class="result-status success">Готово</span>
+                                }
+                                else
+                                {
+                                    <span class="result-status error" title="@item.Status">Ошибка</span>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+</div>
